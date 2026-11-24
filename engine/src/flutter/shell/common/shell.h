@@ -486,6 +486,14 @@ class Shell final : public PlatformView::Delegate,
   std::unique_ptr<PlatformView> platform_view_;  // on platform task runner
   std::unique_ptr<Engine> engine_;               // on UI task runner
   std::unique_ptr<Rasterizer> rasterizer_;       // on raster task runner
+  // FWay patch 0002: external-texture redraws on the raster thread.
+  struct TextureRedraw {
+    std::mutex mutex;
+    std::vector<int64_t> textures;
+    bool scheduled = false;
+  };
+  std::shared_ptr<TextureRedraw> texture_redraw_ =
+      std::make_shared<TextureRedraw>();
   std::shared_ptr<ShellIOManager> io_manager_;   // on IO task runner
   std::shared_ptr<fml::SyncSwitch> is_gpu_disabled_sync_switch_;
   std::shared_ptr<PlatformMessageHandler> platform_message_handler_;

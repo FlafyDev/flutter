@@ -9,6 +9,7 @@
 #define RAPIDJSON_HAS_STDSTRING 1
 #include "flutter/shell/common/shell.h"
 
+#include <cstdlib>
 #include <memory>
 #include <sstream>
 #include <utility>
@@ -1341,9 +1342,64 @@ void Shell::OnPlatformViewUnregisterTexture(int64_t texture_id) {
 }
 
 // |PlatformView::Delegate|
+// FWay patch 0002: with FLUTTER_TEXTURE_REDRAW_ON_RASTER=1, a new external
+// texture frame redraws the last layer trees directly on the raster thread
+// instead of scheduling a frame through the UI thread, so a busy Dart
+// isolate never delays client content (an embedder compositor's windows).
+static bool TextureRedrawOnRaster() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("FLUTTER_TEXTURE_REDRAW_ON_RASTER");
+    return v != nullptr && v[0] == '1';
+  }();
+  return enabled;
+}
+
 void Shell::OnPlatformViewMarkTextureFrameAvailable(int64_t texture_id) {
   FML_DCHECK(is_set_up_);
   FML_DCHECK(task_runners_.GetPlatformTaskRunner()->RunsTasksOnCurrentThread());
+
+  if (TextureRedrawOnRaster()) {
+    bool post = false;
+    {
+      std::scoped_lock lock(texture_redraw_->mutex);
+      texture_redraw_->textures.push_back(texture_id);
+      if (!texture_redraw_->scheduled) {
+        texture_redraw_->scheduled = true;
+        post = true;
+      }
+    }
+    if (post) {
+      task_runners_.GetRasterTaskRunner()->PostTask(
+          [rasterizer = rasterizer_->GetWeakPtr(),
+           redraw = texture_redraw_]() {
+            std::vector<int64_t> textures;
+            {
+              // Updates arriving after this point schedule another redraw.
+              std::scoped_lock lock(redraw->mutex);
+              textures.swap(redraw->textures);
+              redraw->scheduled = false;
+            }
+            if (!rasterizer) {
+              return;
+            }
+            if (auto registry = rasterizer->GetTextureRegistry()) {
+              for (int64_t id : textures) {
+                if (auto texture = registry->GetTexture(id)) {
+                  texture->MarkNewFrameAvailable();
+                }
+              }
+            }
+            auto recorder = std::make_unique<FrameTimingsRecorder>();
+            const auto now = fml::TimePoint::Now();
+            recorder->RecordVsync(now,
+                                  now + fml::TimeDelta::FromMilliseconds(16));
+            recorder->RecordBuildStart(now);
+            recorder->RecordBuildEnd(now);
+            rasterizer->DrawLastLayerTrees(std::move(recorder));
+          });
+    }
+    return;
+  }
 
   // Tell the rasterizer that one of its textures has a new frame available.
   task_runners_.GetRasterTaskRunner()->PostTask(
