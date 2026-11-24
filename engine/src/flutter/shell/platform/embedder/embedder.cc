@@ -104,6 +104,14 @@ extern const intptr_t kPlatformStrongDillSize;
 #ifdef SHELL_ENABLE_VULKAN
 #include "third_party/skia/include/gpu/ganesh/vk/GrVkBackendSurface.h"
 #include "third_party/skia/include/gpu/ganesh/vk/GrVkTypes.h"
+#ifdef IMPELLER_SUPPORTS_RENDERING
+#include "flutter/shell/platform/embedder/embedder_render_target_impeller.h"  // nogncheck
+#include "impeller/renderer/backend/vulkan/formats_vk.h"  // nogncheck
+#include "impeller/renderer/backend/vulkan/swapchain/surface_vk.h"  // nogncheck
+#include "impeller/renderer/backend/vulkan/swapchain/swapchain_transients_vk.h"  // nogncheck
+#include "impeller/renderer/backend/vulkan/texture_wrapper_vk.h"  // nogncheck
+#include "impeller/renderer/render_target.h"  // nogncheck
+#endif  // IMPELLER_SUPPORTS_RENDERING
 #endif  // SHELL_ENABLE_VULKAN
 
 const int32_t kFlutterSemanticsNodeIdBatchEnd = -1;
@@ -1386,6 +1394,83 @@ MakeRenderTargetFromSkSurface(FlutterBackingStore backing_store,
                                        std::move(on_release), nullptr, nullptr);
 }
 
+// Wraps an embedder-supplied VkImage as an Impeller render target, mirroring
+// the onscreen path in GPUSurfaceVulkanImpeller: the image is the MSAA resolve
+// target, with transient MSAA color and depth/stencil attachments.
+//
+// Contract for the embedder: when the engine presents the backing store, all
+// rendering into the image has been *submitted* (not necessarily completed) on
+// the engine's queue, and the image is left in VK_IMAGE_LAYOUT_GENERAL. If the
+// embedder transitions the image, it must return it to GENERAL before the
+// engine renders into the (possibly cached) backing store again.
+static std::unique_ptr<flutter::EmbedderRenderTarget>
+MakeRenderTargetFromBackingStoreImpeller(
+    FlutterBackingStore backing_store,
+    const fml::closure& on_release,
+    const std::shared_ptr<impeller::AiksContext>& aiks_context,
+    const FlutterBackingStoreConfig& config,
+    const FlutterVulkanBackingStore* vulkan) {
+#if defined(SHELL_ENABLE_VULKAN) && defined(IMPELLER_SUPPORTS_RENDERING)
+  if (!aiks_context) {
+    FML_LOG(ERROR) << "No Impeller context for the Vulkan backing store.";
+    return nullptr;
+  }
+  if (!vulkan->image || !vulkan->image->image) {
+    FML_LOG(ERROR) << "Embedder supplied null Vulkan image.";
+    return nullptr;
+  }
+
+  auto vk_format = static_cast<impeller::vk::Format>(vulkan->image->format);
+  std::optional<impeller::PixelFormat> format =
+      impeller::VkFormatToImpellerFormat(vk_format);
+  if (!format.has_value()) {
+    FML_LOG(ERROR) << "Unsupported Vulkan backing store format: "
+                   << impeller::vk::to_string(vk_format);
+    return nullptr;
+  }
+
+  const auto context = aiks_context->GetContext();
+  impeller::TextureDescriptor desc;
+  desc.format = format.value();
+  desc.size = impeller::ISize(config.size.width, config.size.height);
+  desc.storage_mode = impeller::StorageMode::kDevicePrivate;
+  desc.mip_count = 1;
+  desc.compression_type = impeller::CompressionType::kLossless;
+  desc.usage = impeller::TextureUsage::kRenderTarget;
+
+  auto wrapped = impeller::WrapTextureSourceVK(
+      context, desc,
+      impeller::vk::Image(reinterpret_cast<VkImage>(vulkan->image->image)));
+  if (!wrapped) {
+    FML_LOG(ERROR) << "Could not wrap the embedder supplied Vulkan image.";
+    return nullptr;
+  }
+
+  auto transients = std::make_shared<impeller::SwapchainTransientsVK>(
+      context, desc, /*enable_msaa=*/true);
+  auto surface = impeller::SurfaceVK::WrapSwapchainImage(
+      transients, wrapped, []() -> bool { return true; });
+  if (!surface) {
+    FML_LOG(ERROR) << "Could not create a render target for the Vulkan image.";
+    return nullptr;
+  }
+
+  fml::closure image_destruct = [callback = vulkan->destruction_callback,
+                                 user_data = vulkan->user_data]() {
+    if (callback) {
+      callback(user_data);
+    }
+  };
+
+  return std::make_unique<flutter::EmbedderRenderTargetImpeller>(
+      backing_store, aiks_context,
+      std::make_unique<impeller::RenderTarget>(surface->GetRenderTarget()),
+      on_release, image_destruct);
+#else
+  return nullptr;
+#endif
+}
+
 static std::unique_ptr<flutter::EmbedderRenderTarget>
 CreateEmbedderRenderTarget(
     const FlutterCompositor* compositor,
@@ -1523,7 +1608,9 @@ CreateEmbedderRenderTarget(
     }
     case kFlutterBackingStoreTypeVulkan: {
       if (enable_impeller) {
-        FML_LOG(ERROR) << "Unimplemented";
+        render_target = MakeRenderTargetFromBackingStoreImpeller(
+            backing_store, collect_callback.Release(), aiks_context, config,
+            &backing_store.vulkan);
         break;
       } else {
         auto skia_surface = MakeSkSurfaceFromBackingStore(
